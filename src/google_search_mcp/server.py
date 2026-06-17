@@ -91,6 +91,32 @@ def _filtered_tool(*args, **kwargs):
 
 mcp.tool = _filtered_tool
 
+# ---------------------------------------------------------------------------
+# Diagnostics log. Blocks, CAPTCHA attempts, timeouts and errors are appended
+# here so a stuck/failed search has a discoverable cause instead of a silent
+# hang. Best-effort: logging never raises and never blocks a search.
+# ---------------------------------------------------------------------------
+LOG_PATH = os.path.join(os.path.expanduser("~"), ".google_mcp.log")
+# Screenshot of the last page we detected as blocked, for eyeballing why.
+BLOCK_SCREENSHOT_PATH = os.path.join(os.path.expanduser("~"), ".google_mcp_last_block.png")
+
+
+def _log(event: str, **fields):
+    """Append a single structured line to the diagnostics log. Never raises."""
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        parts = [ts, event]
+        for k, v in fields.items():
+            s = str(v).replace("\n", " ").replace("|", "/")
+            if len(s) > 300:
+                s = s[:300] + "…"
+            parts.append(f"{k}={s}")
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(" | ".join(parts) + "\n")
+    except Exception:
+        pass
+
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -306,6 +332,40 @@ async def _try_solve_captcha(page) -> bool:
         return False
     except Exception:
         return False
+
+
+BLOCK_MESSAGE = (
+    "Search blocked by Google bot detection. Your IP may be temporarily "
+    "rate-limited (too many searches in a short window). Wait a minute or two "
+    "and try again, or use a different network. See the log for details: "
+    + LOG_PATH
+)
+
+
+async def _snapshot_block(page):
+    """Save a screenshot of a blocked page for later inspection. Best-effort."""
+    try:
+        await page.screenshot(path=BLOCK_SCREENSHOT_PATH, full_page=False)
+        return BLOCK_SCREENSHOT_PATH
+    except Exception:
+        return ""
+
+
+async def _handle_block(page, tool: str, query: str) -> bool:
+    """Common block path: log it, snapshot the page, then try the CAPTCHA solver.
+
+    Returns True if the block was solved (caller may continue scraping), False
+    if it remains blocked (caller should clear cookies and return BLOCK_MESSAGE).
+    """
+    shot = await _snapshot_block(page)
+    _log("BLOCKED", tool=tool, query=query, url=page.url, screenshot=shot)
+    try:
+        solved = await _try_solve_captcha(page)
+    except Exception as e:
+        _log("CAPTCHA_ERROR", tool=tool, error=repr(e))
+        solved = False
+    _log("CAPTCHA_RESULT", tool=tool, solved=solved)
+    return solved
 
 
 # ---------------------------------------------------------------------------
@@ -614,16 +674,24 @@ async def _do_google_search(
 
             # Detect and handle CAPTCHA/rate-limit blocks
             if await _is_blocked(browser_page):
-                solved = await _try_solve_captcha(browser_page)
-                if not solved:
+                if not await _handle_block(browser_page, "google_search", query):
                     _clear_cookies()
-                    return (
-                        "Search blocked by Google bot detection. "
-                        "Your IP may be temporarily rate-limited. "
-                        "Try again in a few minutes or from a different network."
-                    )
+                    return BLOCK_MESSAGE
 
-            await browser_page.wait_for_selector("div#search", timeout=15000)
+            try:
+                await browser_page.wait_for_selector("div#search", timeout=15000)
+            except Exception:
+                # The results container never appeared. Most often this means we
+                # were quietly redirected to a CAPTCHA/sorry page (div#search is
+                # hidden). Detect, try to solve, and retry once before failing.
+                if await _is_blocked(browser_page):
+                    if not await _handle_block(browser_page, "google_search", query):
+                        _clear_cookies()
+                        return BLOCK_MESSAGE
+                    await browser_page.wait_for_selector("div#search", timeout=15000)
+                else:
+                    _log("TIMEOUT", tool="google_search", query=query, url=browser_page.url)
+                    raise
 
             results = await browser_page.evaluate(
                 """
@@ -699,13 +767,13 @@ async def _do_google_search(
         except Exception as e:
             # Check if the exception was due to bot detection
             if await _is_blocked(browser_page):
+                await _snapshot_block(browser_page)
+                _log("BLOCKED", tool="google_search", query=query,
+                     url=browser_page.url, via="exception")
                 _clear_cookies()
-                return (
-                    "Search blocked by Google bot detection. "
-                    "Your IP may be temporarily rate-limited. "
-                    "Try again in a few minutes or from a different network."
-                )
-            return f"Search failed: {e}"
+                return BLOCK_MESSAGE
+            _log("ERROR", tool="google_search", query=query, error=repr(e))
+            return f"Search failed: {e}. See log: {LOG_PATH}"
 
         finally:
             if save_cookies_on_exit:
@@ -716,7 +784,7 @@ async def _do_google_search(
 @mcp.tool()
 async def google_search(
     query: str,
-    num_results: int = 5,
+    num_results: int = 10,
     time_range: str = "",
     site: str = "",
     page: int = 1,
@@ -736,7 +804,7 @@ async def google_search(
 
     Args:
         query: The search query string.
-        num_results: Number of results to return (default 5, max 10).
+        num_results: Number of results to return (default 10, max 10).
         time_range: Filter by time. One of: "past_hour", "past_day", "past_week", "past_month", "past_year". Leave empty for no filter.
         site: Limit results to a specific domain (e.g. "reddit.com", "stackoverflow.com", "github.com", "arxiv.org", "news.ycombinator.com"). Leave empty for all sites.
         page: Results page number (default 1). Use 2, 3, etc. to get more results.
@@ -775,12 +843,21 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             await _dismiss_consent(page)
 
             if await _is_blocked(page):
-                solved = await _try_solve_captcha(page)
-                if not solved:
+                if not await _handle_block(page, "google_news", query):
                     _clear_cookies()
-                    return []
+                    return BLOCK_MESSAGE
 
-            await page.wait_for_selector("div#search", timeout=15000)
+            try:
+                await page.wait_for_selector("div#search", timeout=15000)
+            except Exception:
+                if await _is_blocked(page):
+                    if not await _handle_block(page, "google_news", query):
+                        _clear_cookies()
+                        return BLOCK_MESSAGE
+                    await page.wait_for_selector("div#search", timeout=15000)
+                else:
+                    _log("TIMEOUT", tool="google_news", query=query, url=page.url)
+                    raise
 
             results = await page.evaluate(
                 """
@@ -901,14 +978,20 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             return content
 
         except Exception as e:
-            return f"News search failed: {e}"
+            if await _is_blocked(page):
+                await _snapshot_block(page)
+                _log("BLOCKED", tool="google_news", query=query, url=page.url, via="exception")
+                _clear_cookies()
+                return BLOCK_MESSAGE
+            _log("ERROR", tool="google_news", query=query, error=repr(e))
+            return f"News search failed: {e}. See log: {LOG_PATH}"
 
         finally:
             await browser.close()
 
 
 @mcp.tool()
-async def google_news(query: str, num_results: int = 5) -> list:
+async def google_news(query: str, num_results: int = 10) -> list:
     """Search Google News for recent headlines, articles, and article images.
 
     Sample prompts that trigger this tool:
@@ -920,7 +1003,7 @@ async def google_news(query: str, num_results: int = 5) -> list:
 
     Args:
         query: The news search query string.
-        num_results: Number of results to return (default 5, max 10).
+        num_results: Number of results to return (default 10, max 10).
     """
     num_results = max(1, min(num_results, 10))
     return await _do_google_news(query, num_results)
@@ -942,7 +1025,23 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
-            await page.wait_for_selector("#gs_res_ccl", timeout=15000)
+
+            if await _is_blocked(page):
+                if not await _handle_block(page, "google_scholar", query):
+                    _clear_cookies()
+                    return BLOCK_MESSAGE
+
+            try:
+                await page.wait_for_selector("#gs_res_ccl", timeout=15000)
+            except Exception:
+                if await _is_blocked(page):
+                    if not await _handle_block(page, "google_scholar", query):
+                        _clear_cookies()
+                        return BLOCK_MESSAGE
+                    await page.wait_for_selector("#gs_res_ccl", timeout=15000)
+                else:
+                    _log("TIMEOUT", tool="google_scholar", query=query, url=page.url)
+                    raise
 
             results = await page.evaluate(
                 """
@@ -1002,14 +1101,20 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
             return "\n".join(lines)
 
         except Exception as e:
-            return f"Scholar search failed: {e}"
+            if await _is_blocked(page):
+                await _snapshot_block(page)
+                _log("BLOCKED", tool="google_scholar", query=query, url=page.url, via="exception")
+                _clear_cookies()
+                return BLOCK_MESSAGE
+            _log("ERROR", tool="google_scholar", query=query, error=repr(e))
+            return f"Scholar search failed: {e}. See log: {LOG_PATH}"
 
         finally:
             await browser.close()
 
 
 @mcp.tool()
-async def google_scholar(query: str, num_results: int = 5) -> str:
+async def google_scholar(query: str, num_results: int = 10) -> str:
     """Search Google Scholar for academic papers, citations, and research.
 
     Sample prompts that trigger this tool:
@@ -1021,7 +1126,7 @@ async def google_scholar(query: str, num_results: int = 5) -> str:
 
     Args:
         query: The academic search query string.
-        num_results: Number of results to return (default 5, max 10).
+        num_results: Number of results to return (default 10, max 10).
     """
     num_results = max(1, min(num_results, 10))
     return await _do_google_scholar(query, num_results)
@@ -1032,7 +1137,7 @@ async def google_scholar(query: str, num_results: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def google_images(query: str, num_results: int = 5) -> list:
+async def google_images(query: str, num_results: int = 10) -> list:
     """Search Google Images and return images inline in chat.
 
     Returns image thumbnails directly in the conversation so you can see them.
@@ -1046,7 +1151,7 @@ async def google_images(query: str, num_results: int = 5) -> list:
 
     Args:
         query: The image search query string.
-        num_results: Number of image results to return (default 5, max 10).
+        num_results: Number of image results to return (default 10, max 10).
     """
     import base64 as b64mod
 
@@ -1061,6 +1166,12 @@ async def google_images(query: str, num_results: int = 5) -> list:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(page)
+
+            if await _is_blocked(page):
+                if not await _handle_block(page, "google_images", query):
+                    _clear_cookies()
+                    return BLOCK_MESSAGE
+
             await page.wait_for_timeout(2000)
 
             results = await page.evaluate(
@@ -1159,7 +1270,13 @@ async def google_images(query: str, num_results: int = 5) -> list:
             return content
 
         except Exception as e:
-            return f"Image search failed: {e}"
+            if await _is_blocked(page):
+                await _snapshot_block(page)
+                _log("BLOCKED", tool="google_images", query=query, url=page.url, via="exception")
+                _clear_cookies()
+                return BLOCK_MESSAGE
+            _log("ERROR", tool="google_images", query=query, error=repr(e))
+            return f"Image search failed: {e}. See log: {LOG_PATH}"
 
         finally:
             await browser.close()

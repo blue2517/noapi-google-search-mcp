@@ -58,6 +58,39 @@ from playwright.async_api import async_playwright
 
 mcp = FastMCP("google-search")
 
+# ---------------------------------------------------------------------------
+# Tool allowlist: only register the tools we actually use. Every function is
+# still defined below (so internal calls keep working), but @mcp.tool() becomes
+# a no-op for any function whose name is NOT in ENABLED_TOOLS, so it is never
+# exposed to the MCP client. To enable a tool, add its function name here.
+# ---------------------------------------------------------------------------
+ENABLED_TOOLS = {
+    "google_search",
+    "google_news",
+    "google_scholar",
+    "google_images",
+    "google_trends",
+    "visit_page",
+    "wikipedia",
+}
+
+_original_tool = mcp.tool
+
+
+def _filtered_tool(*args, **kwargs):
+    """Wrap mcp.tool() so only ENABLED_TOOLS are registered with the server."""
+    decorator = _original_tool(*args, **kwargs)
+
+    def wrapper(func):
+        if func.__name__ in ENABLED_TOOLS:
+            return decorator(func)
+        return func  # not registered as an MCP tool
+
+    return wrapper
+
+
+mcp.tool = _filtered_tool
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -150,30 +183,78 @@ async def _launch_browser(pw, viewport=None):
 
 COOKIE_PATH = os.path.join(os.path.expanduser("~"), ".google_mcp_cookies.json")
 
+# Saved cookies older than this are discarded on load. Stale Google cookies are
+# a common cause of phantom "rate limit" pages, so we keep them short-lived.
+COOKIE_MAX_AGE_SECONDS = 6 * 60 * 60  # 6 hours
+
+# Cookies whose name contains any of these markers are tied to Google's bot /
+# abuse / consent blocking. Persisting them poisons every later request (you
+# keep handing Google the "I was flagged" token), so they are never saved.
+_TAINTED_COOKIE_MARKERS = ("ABUSE", "GOOGLE_ABUSE", "SOCS", "CONSENT")
+
 
 async def _human_delay(page):
     """Add a small random delay to mimic human interaction timing."""
     await page.wait_for_timeout(random.randint(500, 1500))
 
 
+def _clear_cookies():
+    """Delete the persisted cookie file. Called after a block so the next run
+    starts clean instead of replaying the cookies that got us flagged."""
+    try:
+        if os.path.isfile(COOKIE_PATH):
+            os.remove(COOKIE_PATH)
+    except Exception:
+        pass
+
+
 async def _save_cookies(context):
-    """Persist browser cookies to disk so Google sees a returning user."""
+    """Persist browser cookies to disk so Google sees a returning user.
+
+    Tainted (abuse/consent-block) cookies are stripped out before saving, and a
+    timestamp is recorded so stale cookies can be expired on load.
+    """
     try:
         cookies = await context.cookies()
+        clean = [
+            c for c in cookies
+            if not any(m in (c.get("name", "").upper()) for m in _TAINTED_COOKIE_MARKERS)
+        ]
+        payload = {"saved_at": datetime.now(timezone.utc).timestamp(), "cookies": clean}
         with open(COOKIE_PATH, "w") as f:
-            json.dump(cookies, f)
+            json.dump(payload, f)
     except Exception:
         pass
 
 
 async def _load_cookies(context):
-    """Load previously saved cookies into the browser context."""
+    """Load previously saved cookies into the browser context, skipping cookies
+    that are stale (older than COOKIE_MAX_AGE_SECONDS) or tainted."""
     try:
-        if os.path.isfile(COOKIE_PATH):
-            with open(COOKIE_PATH, "r") as f:
-                cookies = json.load(f)
-            if cookies:
-                await context.add_cookies(cookies)
+        if not os.path.isfile(COOKIE_PATH):
+            return
+        with open(COOKIE_PATH, "r") as f:
+            data = json.load(f)
+
+        # Support both the new {saved_at, cookies} format and the legacy bare list.
+        if isinstance(data, dict):
+            saved_at = data.get("saved_at", 0)
+            cookies = data.get("cookies", [])
+        else:
+            saved_at = 0
+            cookies = data
+
+        age = datetime.now(timezone.utc).timestamp() - saved_at
+        if saved_at and age > COOKIE_MAX_AGE_SECONDS:
+            _clear_cookies()
+            return
+
+        cookies = [
+            c for c in cookies
+            if not any(m in (c.get("name", "").upper()) for m in _TAINTED_COOKIE_MARKERS)
+        ]
+        if cookies:
+            await context.add_cookies(cookies)
     except Exception:
         pass
 
@@ -522,6 +603,11 @@ async def _do_google_search(
         await _load_cookies(context)
         browser_page = await context.new_page()
 
+        # Only persist cookies after a clean, successful run. If we get blocked
+        # we drop the cookie file instead, so the next run does not replay the
+        # flagged session and re-trigger the rate-limit page.
+        save_cookies_on_exit = False
+
         try:
             await browser_page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await _dismiss_consent(browser_page)
@@ -530,7 +616,7 @@ async def _do_google_search(
             if await _is_blocked(browser_page):
                 solved = await _try_solve_captcha(browser_page)
                 if not solved:
-                    await _save_cookies(context)
+                    _clear_cookies()
                     return (
                         "Search blocked by Google bot detection. "
                         "Your IP may be temporarily rate-limited. "
@@ -607,12 +693,13 @@ async def _do_google_search(
                     lines.append(f"   {r['snippet']}")
                 lines.append("")
 
+            save_cookies_on_exit = True
             return "\n".join(lines)
 
         except Exception as e:
             # Check if the exception was due to bot detection
             if await _is_blocked(browser_page):
-                await _save_cookies(context)
+                _clear_cookies()
                 return (
                     "Search blocked by Google bot detection. "
                     "Your IP may be temporarily rate-limited. "
@@ -621,7 +708,8 @@ async def _do_google_search(
             return f"Search failed: {e}"
 
         finally:
-            await _save_cookies(context)
+            if save_cookies_on_exit:
+                await _save_cookies(context)
             await browser.close()
 
 
@@ -689,7 +777,7 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             if await _is_blocked(page):
                 solved = await _try_solve_captcha(page)
                 if not solved:
-                    await _save_cookies(context)
+                    _clear_cookies()
                     return []
 
             await page.wait_for_selector("div#search", timeout=15000)

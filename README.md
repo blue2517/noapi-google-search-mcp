@@ -644,6 +644,25 @@ pipx install noapi-google-search-mcp
 playwright install chromium
 ```
 
+The base install (search, news, scholar, images, trends, page fetch, Wikipedia,
+feeds, email, etc.) needs only `mcp` + `playwright`, so it installs cleanly on
+**every Python 3.10–3.13**.
+
+### Optional feature extras
+
+The heavy backends are optional so the core stays installable everywhere
+(notably Python 3.13, where `rapidocr-onnxruntime` has no wheel yet — see #6):
+
+```bash
+pip install "noapi-google-search-mcp[ocr]"     # local OCR (ocr_image, scanned PDFs)
+pip install "noapi-google-search-mcp[video]"   # YouTube/video download + transcription
+pip install "noapi-google-search-mcp[vision]"  # object detection, image-CAPTCHA solver
+pip install "noapi-google-search-mcp[all]"     # everything (pre-0.3.2 default)
+```
+
+> The `[ocr]` extra (`rapidocr-onnxruntime`) currently has no wheel for Python
+> 3.13. If you need OCR, use Python 3.10–3.12; all other tools work on 3.13.
+
 ### Install in a Virtual Environment
 
 ```bash

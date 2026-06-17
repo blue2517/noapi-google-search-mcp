@@ -44,6 +44,7 @@ import random
 import re
 import sqlite3
 import subprocess
+import sys
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -117,8 +118,18 @@ def _log(event: str, **fields):
         pass
 
 
+# Use a User-Agent that matches the host OS. A Linux UA on a Windows host (or
+# vice-versa) is a strong bot signal: Google cross-checks the UA against other
+# fingerprint bits (platform, client hints) and flags the mismatch.
+if sys.platform == "darwin":
+    _UA_PLATFORM = "Macintosh; Intel Mac OS X 10_15_7"
+elif sys.platform.startswith("win"):
+    _UA_PLATFORM = "Windows NT 10.0; Win64; x64"
+else:
+    _UA_PLATFORM = "X11; Linux x86_64"
+
 USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    f"Mozilla/5.0 ({_UA_PLATFORM}) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 
@@ -185,17 +196,26 @@ TIME_RANGE_MAP = {
 
 
 async def _launch_browser(pw, viewport=None):
-    """Launch a headless Chromium browser with stealth settings to avoid bot detection."""
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-infobars",
-            "--window-size=1280,800",
-        ],
-    )
+    """Launch a headless Chromium browser with stealth settings to avoid bot detection.
+
+    Prefers the system-installed Chrome (channel="chrome") over the bundled
+    Chromium: real Chrome has a far cleaner fingerprint (proper client hints,
+    codecs, branding), so Google flags it much less often. Falls back to bundled
+    Chromium if Chrome isn't installed.
+    """
+    launch_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-infobars",
+        "--window-size=1280,800",
+    ]
+    try:
+        browser = await pw.chromium.launch(
+            headless=True, channel="chrome", args=launch_args
+        )
+    except Exception:
+        browser = await pw.chromium.launch(headless=True, args=launch_args)
     vp = viewport or {"width": 1280, "height": 800}
     context = await browser.new_context(
         user_agent=USER_AGENT,
@@ -334,6 +354,9 @@ async def _try_solve_captcha(page) -> bool:
         return False
 
 
+# Hard ceiling (seconds) on the CAPTCHA solver so a block never hangs the call.
+CAPTCHA_SOLVE_TIMEOUT = 20
+
 BLOCK_MESSAGE = (
     "Search blocked by Google bot detection. Your IP may be temporarily "
     "rate-limited (too many searches in a short window). Wait a minute or two "
@@ -360,7 +383,13 @@ async def _handle_block(page, tool: str, query: str) -> bool:
     shot = await _snapshot_block(page)
     _log("BLOCKED", tool=tool, query=query, url=page.url, screenshot=shot)
     try:
-        solved = await _try_solve_captcha(page)
+        # Hard cap the solver. Google's reCAPTCHA is rarely solvable by an offline
+        # model, and without a deadline the chained Playwright locators each burn
+        # their full 30s timeout, hanging the whole call for ~2 minutes. Bail fast.
+        solved = await asyncio.wait_for(_try_solve_captcha(page), timeout=CAPTCHA_SOLVE_TIMEOUT)
+    except asyncio.TimeoutError:
+        _log("CAPTCHA_TIMEOUT", tool=tool, seconds=CAPTCHA_SOLVE_TIMEOUT)
+        solved = False
     except Exception as e:
         _log("CAPTCHA_ERROR", tool=tool, error=repr(e))
         solved = False
@@ -847,17 +876,28 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
                     _clear_cookies()
                     return BLOCK_MESSAGE
 
+            # Google News (tbm=nws) ships several DOM variants. The outer
+            # div#search is sometimes present but kept hidden, so waiting for it
+            # to be *visible* can hang the full 15s even on a good page. Wait for
+            # the actual result tiles instead, and fall back to networkidle so a
+            # layout we don't recognize still gets scraped rather than erroring.
+            news_selector = "div#search div.SoaBEf, div#search div.g, div#rso div.SoaBEf"
             try:
-                await page.wait_for_selector("div#search", timeout=15000)
+                await page.wait_for_selector(news_selector, timeout=15000)
             except Exception:
                 if await _is_blocked(page):
                     if not await _handle_block(page, "google_news", query):
                         _clear_cookies()
                         return BLOCK_MESSAGE
-                    await page.wait_for_selector("div#search", timeout=15000)
+                    await page.wait_for_selector(news_selector, timeout=15000)
                 else:
-                    _log("TIMEOUT", tool="google_news", query=query, url=page.url)
-                    raise
+                    # Not blocked, just an unfamiliar layout. Give the page a
+                    # moment to settle, then let the scraper try anyway.
+                    _log("NEWS_SELECTOR_MISS", tool="google_news", query=query, url=page.url)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
 
             results = await page.evaluate(
                 """
@@ -3553,7 +3593,7 @@ async def _do_google_lens_detect(image_path: str) -> str:
     try:
         import cv2
     except ImportError:
-        return "opencv-python-headless is required for object detection. Install with: pip install opencv-python-headless"
+        return "opencv-python-headless is required for object detection. Install with: pip install 'noapi-google-search-mcp[vision]' (or: pip install opencv-python-headless)"
 
     file_path = str(Path(image_path).expanduser().resolve())
     if not os.path.isfile(file_path):
@@ -3742,7 +3782,7 @@ async def ocr_image(image_source: str) -> str:
     try:
         from rapidocr_onnxruntime import RapidOCR
     except ImportError:
-        return "rapidocr-onnxruntime is required for OCR. Install with: pip install rapidocr-onnxruntime"
+        return "rapidocr-onnxruntime is required for OCR. Install with: pip install 'noapi-google-search-mcp[ocr]' (or: pip install rapidocr-onnxruntime). Note: no wheel exists for Python 3.13 yet — use Python 3.10–3.12 for OCR."
 
     # Handle base64 input
     tmp_base64_path = None
@@ -3962,12 +4002,12 @@ async def transcribe_video(
     try:
         import yt_dlp  # noqa: F401
     except ImportError:
-        return "yt-dlp is required. Install with: pip install yt-dlp"
+        return "yt-dlp is required. Install with: pip install 'noapi-google-search-mcp[video]' (or: pip install yt-dlp)"
 
     try:
         from faster_whisper import WhisperModel  # noqa: F401
     except ImportError:
-        return "faster-whisper is required. Install with: pip install faster-whisper"
+        return "faster-whisper is required. Install with: pip install 'noapi-google-search-mcp[video]' (or: pip install faster-whisper)"
 
     os.makedirs(TRANSCRIBE_CACHE_DIR, exist_ok=True)
 
@@ -4361,7 +4401,7 @@ async def extract_video_clip(
         try:
             import yt_dlp  # noqa: F401
         except ImportError:
-            return "yt-dlp is required. Install with: pip install yt-dlp"
+            return "yt-dlp is required. Install with: pip install 'noapi-google-search-mcp[video]' (or: pip install yt-dlp)"
 
         if ctx:
             await ctx.report_progress(progress=0, total=100, message="Downloading video...")
@@ -4530,7 +4570,7 @@ async def transcribe_local(
     try:
         from faster_whisper import WhisperModel  # noqa: F401
     except ImportError:
-        return "faster-whisper is required. Install with: pip install faster-whisper"
+        return "faster-whisper is required. Install with: pip install 'noapi-google-search-mcp[video]' (or: pip install faster-whisper)"
 
     if ctx:
         await ctx.report_progress(
@@ -5194,7 +5234,7 @@ async def generate_qr(
         import cv2
         import numpy as np
     except ImportError:
-        return "OpenCV is required. Install with: pip install opencv-python-headless"
+        return "OpenCV is required. Install with: pip install 'noapi-google-search-mcp[vision]' (or: pip install opencv-python-headless)"
 
     if not output_path:
         output_path = os.path.join(os.path.expanduser("~"), "qr_code.png")

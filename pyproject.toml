@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "noapi-google-search-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "38 tools for Local LLMs — Google Search, live feeds, email, documents, QR codes, Wikipedia, S3 upload, vision, OCR, video transcription. No API key required."
 readme = "README.md"
 license = "MIT"
@@ -24,9 +24,25 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries",
 ]
+# Core deps only. The heavy/optional backends (OCR, video, vision) are split
+# into extras below so the package installs cleanly on Python 3.13, where
+# rapidocr-onnxruntime publishes no wheel (issue #6). They are all lazy-imported,
+# so the tools that need them just report a clear "pip install" hint when the
+# matching extra isn't installed.
 dependencies = [
     "mcp>=1.0.0",
     "playwright>=1.40.0",
+]
+
+[project.optional-dependencies]
+# Local OCR: ocr_image and scanned-PDF text extraction
+ocr = ["rapidocr-onnxruntime>=1.4.0"]
+# Video download / transcription
+video = ["yt-dlp>=2024.0", "faster-whisper>=1.0.0"]
+# Computer-vision helpers: object detection, image-CAPTCHA solver
+vision = ["opencv-python-headless>=4.8.0"]
+# Everything (matches the pre-0.3.2 default install)
+all = [
     "opencv-python-headless>=4.8.0",
     "rapidocr-onnxruntime>=1.4.0",
     "yt-dlp>=2024.0",

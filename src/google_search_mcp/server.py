@@ -42,6 +42,7 @@ import json
 import os
 import random
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -195,13 +196,40 @@ TIME_RANGE_MAP = {
 }
 
 
-async def _launch_browser(pw, viewport=None):
-    """Launch a headless Chromium browser with stealth settings to avoid bot detection.
+# Persistent Chrome profile. Reusing one profile across runs makes Google see an
+# aged, consistent user (stable cookies/history) instead of a brand-new identity
+# every search, which meaningfully reduces how often we hit a challenge at all.
+USER_DATA_DIR = os.path.join(os.path.expanduser("~"), ".google_mcp_profile")
+# Sentinel: when present, the NEXT launch wipes the profile before using it. We
+# reset lazily (not inline) because the dir is locked while a browser holds it,
+# and especially on Windows you can't rmtree a profile that's still in use.
+_PROFILE_RESET_SENTINEL = os.path.join(os.path.expanduser("~"), ".google_mcp_profile_reset")
 
-    Prefers the system-installed Chrome (channel="chrome") over the bundled
-    Chromium: real Chrome has a far cleaner fingerprint (proper client hints,
-    codecs, branding), so Google flags it much less often. Falls back to bundled
-    Chromium if Chrome isn't installed.
+
+def _schedule_profile_reset():
+    """Mark the persistent profile for a wipe on the next launch. Called after a
+    block so we don't keep replaying the abuse/consent cookies that got us
+    flagged (a persistent profile stores those natively, so clearing the JSON
+    cookie file alone is not enough)."""
+    try:
+        with open(_PROFILE_RESET_SENTINEL, "w") as f:
+            f.write("reset")
+    except Exception:
+        pass
+
+
+async def _launch_browser(pw, viewport=None):
+    """Launch a headless browser with stealth settings to avoid bot detection.
+
+    Uses a *persistent* Chrome profile (USER_DATA_DIR) so Google sees a returning
+    user rather than a fresh identity each time — this is the single biggest
+    lever for not getting flagged. Prefers system Chrome (channel="chrome") for a
+    cleaner fingerprint. Falls back to an ephemeral bundled-Chromium context if
+    the profile is locked (concurrent call) or Chrome isn't installed.
+
+    Returns (closeable, context). In persistent mode both are the same
+    BrowserContext, so callers' `browser, context = ...` / `browser.close()`
+    pattern keeps working unchanged.
     """
     launch_args = [
         "--disable-blink-features=AutomationControlled",
@@ -210,19 +238,47 @@ async def _launch_browser(pw, viewport=None):
         "--disable-infobars",
         "--window-size=1280,800",
     ]
+    vp = viewport or {"width": 1280, "height": 800}
+
+    # Deferred profile reset: if a previous run got blocked, start clean now.
+    if os.path.exists(_PROFILE_RESET_SENTINEL):
+        try:
+            shutil.rmtree(USER_DATA_DIR, ignore_errors=True)
+        finally:
+            try:
+                os.remove(_PROFILE_RESET_SENTINEL)
+            except OSError:
+                pass
+
+    # Preferred path: persistent profile with real Chrome.
+    try:
+        context = await pw.chromium.launch_persistent_context(
+            USER_DATA_DIR,
+            headless=True,
+            channel="chrome",
+            args=launch_args,
+            user_agent=USER_AGENT,
+            viewport=vp,
+            locale="en-US",
+        )
+        await context.add_init_script(STEALTH_JS)
+        return context, context
+    except Exception as e:
+        _log("PERSISTENT_PROFILE_FALLBACK", error=repr(e))
+
+    # Fallback: ephemeral context (profile locked by a concurrent run, or no
+    # Chrome). Try Chrome first, then bundled Chromium.
     try:
         browser = await pw.chromium.launch(
             headless=True, channel="chrome", args=launch_args
         )
     except Exception:
         browser = await pw.chromium.launch(headless=True, args=launch_args)
-    vp = viewport or {"width": 1280, "height": 800}
     context = await browser.new_context(
         user_agent=USER_AGENT,
         viewport=vp,
         locale="en-US",
     )
-    # Inject stealth patches before any page loads
     await context.add_init_script(STEALTH_JS)
     return browser, context
 
@@ -244,14 +300,20 @@ async def _human_delay(page):
     await page.wait_for_timeout(random.randint(500, 1500))
 
 
-def _clear_cookies():
+def _clear_cookies(reset_profile: bool = False):
     """Delete the persisted cookie file. Called after a block so the next run
-    starts clean instead of replaying the cookies that got us flagged."""
+    starts clean instead of replaying the cookies that got us flagged.
+
+    When reset_profile is True (i.e. we were actually blocked, not just expiring
+    stale cookies), also schedule a wipe of the persistent browser profile, which
+    stores Google's abuse/consent cookies natively."""
     try:
         if os.path.isfile(COOKIE_PATH):
             os.remove(COOKIE_PATH)
     except Exception:
         pass
+    if reset_profile:
+        _schedule_profile_reset()
 
 
 async def _save_cookies(context):
@@ -344,7 +406,14 @@ async def _try_solve_captcha(page) -> bool:
                 if not await _is_blocked(page):
                     return True
 
-        # Step 2: Checkbox wasn't enough, try solving the image challenge
+        # Step 2: Checkbox wasn't enough. Try the audio challenge first — it is
+        # reCAPTCHA's documented weak point and far more solvable than the image
+        # grid for automation, since we can transcribe it with whisper.
+        solved = await _solve_audio_challenge(page)
+        if solved:
+            return True
+
+        # Step 3: Audio failed/unavailable; fall back to the image challenge.
         solved = await _solve_image_challenge(page)
         if solved:
             return True
@@ -355,7 +424,10 @@ async def _try_solve_captcha(page) -> bool:
 
 
 # Hard ceiling (seconds) on the CAPTCHA solver so a block never hangs the call.
-CAPTCHA_SOLVE_TIMEOUT = 20
+# Higher than before because the audio leg downloads + transcribes a clip; the
+# audio/image locators all use short explicit timeouts so failures still bail
+# fast and we never approach this ceiling on a non-challenge block.
+CAPTCHA_SOLVE_TIMEOUT = 45
 
 BLOCK_MESSAGE = (
     "Search blocked by Google bot detection. Your IP may be temporarily "
@@ -523,6 +595,149 @@ def _classify_cells(cells: list[bytes], prompt_keywords: list[str]) -> list[bool
     return results
 
 
+# ---------------------------------------------------------------------------
+# YOLO object-detection CAPTCHA classifier (preferred over MobileNet)
+# ---------------------------------------------------------------------------
+# reCAPTCHA prompts are object-detection tasks ("select all images with traffic
+# lights"). YOLO's COCO classes line up with these prompts far better than
+# MobileNet's ImageNet labels (which have no class for crosswalk/hydrant/etc.),
+# so we try YOLO first and keep MobileNet as a fallback.
+
+YOLO_ONNX = os.path.join(CAPTCHA_MODEL_DIR, "yolov8n.onnx")
+
+# 80 COCO class names in the canonical order YOLOv8 emits.
+COCO_CLASSES = [
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag",
+    "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon",
+    "bowl", "banana", "apple", "sandwich", "orange", "broccoli", "carrot",
+    "hot dog", "pizza", "donut", "cake", "chair", "couch", "potted plant",
+    "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush",
+]
+
+# Map reCAPTCHA prompt keywords to the COCO class names that satisfy them.
+CAPTCHA_COCO_MAP = {
+    "traffic light": ["traffic light"],
+    "fire hydrant": ["fire hydrant"],
+    "hydrant": ["fire hydrant"],
+    "stop sign": ["stop sign"],
+    "bus": ["bus"],
+    "car": ["car", "truck"],
+    "vehicle": ["car", "truck", "bus", "motorcycle"],
+    "taxi": ["car"],
+    "cab": ["car"],
+    "truck": ["truck"],
+    "motorcycle": ["motorcycle"],
+    "bicycle": ["bicycle"],
+    "boat": ["boat"],
+    "train": ["train"],
+    "airplane": ["airplane"],
+    "plane": ["airplane"],
+    "parking meter": ["parking meter"],
+}
+
+
+def _ensure_yolo_model() -> bool:
+    """Download the YOLOv8n ONNX model if not present. Returns True if available."""
+    os.makedirs(CAPTCHA_MODEL_DIR, exist_ok=True)
+    if os.path.isfile(YOLO_ONNX):
+        return True
+    try:
+        # YOLOv8n ONNX (input [1,3,640,640], output [1,84,8400]), pinned to an
+        # immutable commit so the asset can't change/disappear under us.
+        model_url = (
+            "https://huggingface.co/SpotLab/YOLOv8Detection/resolve/"
+            "3005c6751fb19cdeb6b10c066185908faf66a097/yolov8n.onnx?download=true"
+        )
+        req = urllib.request.Request(model_url, headers={"User-Agent": "NoAPI-MCP/1.0"})
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            data = resp.read()
+        # Sanity check: a real ONNX is well over 1 MB; a 404 HTML page is tiny.
+        if len(data) < 100_000:
+            return False
+        with open(YOLO_ONNX, "wb") as f:
+            f.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def _classify_cells_yolo(cells: list[bytes], prompt_keywords: list[str]) -> list[bool]:
+    """Classify reCAPTCHA grid cells with YOLOv8n. Returns one bool per cell.
+
+    Returns all-False if YOLO/onnxruntime is unavailable, the prompt maps to no
+    COCO class, or nothing is detected — letting the caller fall back to the
+    MobileNet classifier.
+    """
+    try:
+        import cv2
+        import numpy as np
+        import onnxruntime as ort
+    except ImportError:
+        return [False] * len(cells)
+
+    if not _ensure_yolo_model():
+        return [False] * len(cells)
+
+    # Resolve prompt keywords → target COCO class indices.
+    target_idx = set()
+    for keyword in prompt_keywords:
+        kw = keyword.lower()
+        for prompt_key, coco_names in CAPTCHA_COCO_MAP.items():
+            if prompt_key in kw or kw in prompt_key:
+                for name in coco_names:
+                    if name in COCO_CLASSES:
+                        target_idx.add(COCO_CLASSES.index(name))
+    if not target_idx:
+        return [False] * len(cells)
+
+    try:
+        session = ort.InferenceSession(YOLO_ONNX)
+        input_name = session.get_inputs()[0].name
+    except Exception:
+        return [False] * len(cells)
+
+    conf_threshold = 0.30
+    results = []
+    for cell_bytes in cells:
+        try:
+            arr = np.frombuffer(cell_bytes, np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                results.append(False)
+                continue
+
+            # Preprocess: letterbox-free resize to 640x640, RGB, NCHW, 0-1.
+            blob = cv2.resize(img, (640, 640))
+            blob = cv2.cvtColor(blob, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            blob = np.transpose(blob, (2, 0, 1))[np.newaxis, :]
+
+            out = session.run(None, {input_name: blob})[0]
+            # YOLOv8 output is [1, 84, 8400]: 4 box coords + 80 class scores.
+            preds = np.squeeze(out, 0)
+            if preds.shape[0] == 84:
+                preds = preds.T  # -> [8400, 84]
+            class_scores = preds[:, 4:]
+            # Does any detection of a target class clear the threshold?
+            hit = False
+            for idx in target_idx:
+                if idx < class_scores.shape[1] and class_scores[:, idx].max() >= conf_threshold:
+                    hit = True
+                    break
+            results.append(hit)
+        except Exception:
+            results.append(False)
+
+    return results
+
+
 async def _solve_image_challenge(page) -> bool:
     """Attempt to solve a reCAPTCHA image challenge using MobileNetV2 neural net."""
     try:
@@ -590,8 +805,12 @@ async def _solve_image_challenge(page) -> bool:
                 _, cell_bytes = cv2.imencode(".png", cell)
                 cells.append(cell_bytes.tobytes())
 
-        # Classify each cell with the neural net
-        matches = _classify_cells(cells, prompt_keywords)
+        # Classify each cell. Prefer YOLO (COCO classes match reCAPTCHA prompts
+        # well); fall back to the MobileNet classifier if YOLO finds nothing or
+        # its model is unavailable.
+        matches = _classify_cells_yolo(cells, prompt_keywords)
+        if not any(matches):
+            matches = _classify_cells(cells, prompt_keywords)
 
         if not any(matches):
             return False
@@ -622,6 +841,118 @@ async def _solve_image_challenge(page) -> bool:
         return not await _is_blocked(page)
 
     except Exception:
+        return False
+
+
+# Strip everything but letters/spaces from a whisper transcript so it matches
+# what reCAPTCHA's audio answer box expects (lowercase words, no punctuation).
+def _clean_audio_answer(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9 ]+", " ", text.lower())
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+async def _solve_audio_challenge(page) -> bool:
+    """Attempt to solve a reCAPTCHA audio challenge by transcribing the clip.
+
+    Audio is reCAPTCHA's documented weak point: the clip is a short spoken
+    phrase that faster-whisper transcribes reliably, whereas the image grid is
+    judged largely on behaviour/fingerprint and rarely passes for automation.
+    Best-effort — any failure returns False so the caller falls back to image.
+    """
+    try:
+        from faster_whisper import WhisperModel  # noqa: F401
+    except ImportError:
+        _log("AUDIO_SKIP", reason="faster-whisper not installed")
+        return False
+
+    try:
+        # Locate the challenge iframe (same approach as the image solver).
+        challenge_frame = None
+        for frame in page.frames:
+            if "recaptcha" in (frame.url or "") and "bframe" in (frame.url or ""):
+                challenge_frame = frame
+                break
+        if not challenge_frame:
+            return False
+
+        # Switch to the audio challenge. If only the image grid is up, click the
+        # headphones button first.
+        audio_btn = challenge_frame.locator("#recaptcha-audio-button, .rc-button-audio")
+        if await audio_btn.count() > 0:
+            try:
+                await audio_btn.first.click(timeout=5000)
+                await page.wait_for_timeout(random.randint(800, 1500))
+            except Exception:
+                pass
+
+        # Google sometimes hard-blocks the audio path with "Your computer or
+        # network may be sending automated queries". Bail fast if so.
+        try:
+            body_text = (await challenge_frame.locator("body").inner_text()) or ""
+            if "automated queries" in body_text.lower():
+                _log("AUDIO_HARDBLOCK", note="automated queries message")
+                return False
+        except Exception:
+            pass
+
+        # Find the mp3 URL: prefer the download link, fall back to the <source>.
+        mp3_url = ""
+        dl = challenge_frame.locator(".rc-audiochallenge-tdownload-link")
+        if await dl.count() > 0:
+            mp3_url = (await dl.first.get_attribute("href")) or ""
+        if not mp3_url:
+            src = challenge_frame.locator("#audio-source, audio#audio-source source")
+            if await src.count() > 0:
+                mp3_url = (await src.first.get_attribute("src")) or ""
+        if not mp3_url:
+            _log("AUDIO_NO_URL")
+            return False
+
+        # Download the clip using the browser's request context (keeps cookies).
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "noapi-google-search-mcp")
+        os.makedirs(cache_dir, exist_ok=True)
+        audio_path = os.path.join(cache_dir, "recaptcha_audio.mp3")
+        try:
+            resp = await page.context.request.get(mp3_url, timeout=10000)
+            if not resp.ok:
+                _log("AUDIO_DL_FAIL", status=resp.status)
+                return False
+            with open(audio_path, "wb") as f:
+                f.write(await resp.body())
+        except Exception as e:
+            _log("AUDIO_DL_ERROR", error=repr(e))
+            return False
+
+        # Transcribe with whisper (tiny model is plenty for a short clip).
+        try:
+            info = await asyncio.to_thread(_transcribe_audio, audio_path, "tiny", "en")
+            raw = " ".join(s["text"] for s in info.get("segments", []))
+        except Exception as e:
+            _log("AUDIO_TRANSCRIBE_ERROR", error=repr(e))
+            return False
+        answer = _clean_audio_answer(raw)
+        _log("AUDIO_TRANSCRIBED", answer=answer)
+        if not answer:
+            return False
+
+        # Type the answer and verify.
+        response_box = challenge_frame.locator("#audio-response")
+        if await response_box.count() == 0:
+            return False
+        await response_box.first.fill(answer)
+        await page.wait_for_timeout(random.randint(400, 900))
+
+        verify_btn = challenge_frame.locator("#recaptcha-verify-button")
+        if await verify_btn.count() > 0:
+            await verify_btn.first.click()
+            await page.wait_for_timeout(random.randint(2500, 4000))
+
+        solved = not await _is_blocked(page)
+        _log("AUDIO_RESULT", solved=solved)
+        return solved
+
+    except Exception as e:
+        _log("AUDIO_ERROR", error=repr(e))
         return False
 
 
@@ -704,7 +1035,7 @@ async def _do_google_search(
             # Detect and handle CAPTCHA/rate-limit blocks
             if await _is_blocked(browser_page):
                 if not await _handle_block(browser_page, "google_search", query):
-                    _clear_cookies()
+                    _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
             try:
@@ -715,7 +1046,7 @@ async def _do_google_search(
                 # hidden). Detect, try to solve, and retry once before failing.
                 if await _is_blocked(browser_page):
                     if not await _handle_block(browser_page, "google_search", query):
-                        _clear_cookies()
+                        _clear_cookies(reset_profile=True)
                         return BLOCK_MESSAGE
                     await browser_page.wait_for_selector("div#search", timeout=15000)
                 else:
@@ -799,7 +1130,7 @@ async def _do_google_search(
                 await _snapshot_block(browser_page)
                 _log("BLOCKED", tool="google_search", query=query,
                      url=browser_page.url, via="exception")
-                _clear_cookies()
+                _clear_cookies(reset_profile=True)
                 return BLOCK_MESSAGE
             _log("ERROR", tool="google_search", query=query, error=repr(e))
             return f"Search failed: {e}. See log: {LOG_PATH}"
@@ -873,7 +1204,7 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
 
             if await _is_blocked(page):
                 if not await _handle_block(page, "google_news", query):
-                    _clear_cookies()
+                    _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
             # Google News (tbm=nws) ships several DOM variants. The outer
@@ -887,7 +1218,7 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             except Exception:
                 if await _is_blocked(page):
                     if not await _handle_block(page, "google_news", query):
-                        _clear_cookies()
+                        _clear_cookies(reset_profile=True)
                         return BLOCK_MESSAGE
                     await page.wait_for_selector(news_selector, timeout=15000)
                 else:
@@ -1021,7 +1352,7 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             if await _is_blocked(page):
                 await _snapshot_block(page)
                 _log("BLOCKED", tool="google_news", query=query, url=page.url, via="exception")
-                _clear_cookies()
+                _clear_cookies(reset_profile=True)
                 return BLOCK_MESSAGE
             _log("ERROR", tool="google_news", query=query, error=repr(e))
             return f"News search failed: {e}. See log: {LOG_PATH}"
@@ -1068,7 +1399,7 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
 
             if await _is_blocked(page):
                 if not await _handle_block(page, "google_scholar", query):
-                    _clear_cookies()
+                    _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
             try:
@@ -1076,7 +1407,7 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
             except Exception:
                 if await _is_blocked(page):
                     if not await _handle_block(page, "google_scholar", query):
-                        _clear_cookies()
+                        _clear_cookies(reset_profile=True)
                         return BLOCK_MESSAGE
                     await page.wait_for_selector("#gs_res_ccl", timeout=15000)
                 else:
@@ -1144,7 +1475,7 @@ async def _do_google_scholar(query: str, num_results: int = 5) -> str:
             if await _is_blocked(page):
                 await _snapshot_block(page)
                 _log("BLOCKED", tool="google_scholar", query=query, url=page.url, via="exception")
-                _clear_cookies()
+                _clear_cookies(reset_profile=True)
                 return BLOCK_MESSAGE
             _log("ERROR", tool="google_scholar", query=query, error=repr(e))
             return f"Scholar search failed: {e}. See log: {LOG_PATH}"
@@ -1209,7 +1540,7 @@ async def google_images(query: str, num_results: int = 10) -> list:
 
             if await _is_blocked(page):
                 if not await _handle_block(page, "google_images", query):
-                    _clear_cookies()
+                    _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
             await page.wait_for_timeout(2000)
@@ -1313,7 +1644,7 @@ async def google_images(query: str, num_results: int = 10) -> list:
             if await _is_blocked(page):
                 await _snapshot_block(page)
                 _log("BLOCKED", tool="google_images", query=query, url=page.url, via="exception")
-                _clear_cookies()
+                _clear_cookies(reset_profile=True)
                 return BLOCK_MESSAGE
             _log("ERROR", tool="google_images", query=query, error=repr(e))
             return f"Image search failed: {e}. See log: {LOG_PATH}"

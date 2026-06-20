@@ -4785,10 +4785,10 @@ async def extract_video_clip(
 # visit_page
 # ---------------------------------------------------------------------------
 
-MAX_PAGE_CHARS = 8000
+DEFAULT_MAX_PAGE_CHARS = int(os.environ.get("MAX_PAGE_CHARS", "20000"))
 
 
-async def _fetch_page_text(url: str) -> str:
+async def _fetch_page_text(url: str, max_chars: int = DEFAULT_MAX_PAGE_CHARS) -> str:
     """Fetch a URL with headless Chromium and extract readable text."""
     async with async_playwright() as pw:
         browser, context = await _launch_browser(pw)
@@ -4821,8 +4821,8 @@ async def _fetch_page_text(url: str) -> str:
             if not text:
                 return f"Could not extract text content from: {url}"
 
-            if len(text) > MAX_PAGE_CHARS:
-                text = text[:MAX_PAGE_CHARS] + f"\n\n... [truncated, showing first {MAX_PAGE_CHARS} characters]"
+            if max_chars > 0 and len(text) > max_chars:
+                text = text[:max_chars] + f"\n\n... [truncated, showing first {max_chars} characters]"
 
             return f"Content from: {url}\n\n{text}"
 
@@ -4834,7 +4834,7 @@ async def _fetch_page_text(url: str) -> str:
 
 
 @mcp.tool()
-async def visit_page(url: str) -> str:
+async def visit_page(url: str, max_chars: int = DEFAULT_MAX_PAGE_CHARS) -> str:
     """Fetch a web page and return its text content. Use this after google_search to read the actual content of a result.
 
     Sample prompts that trigger this tool:
@@ -4845,8 +4845,9 @@ async def visit_page(url: str) -> str:
 
     Args:
         url: The full URL to visit and extract text from.
+        max_chars: Maximum number of characters to return (default 20000). Content exceeding this limit will be truncated. Set to 0 to disable truncation and return the full page content. Use a larger value (e.g. 100000) when you need to read long articles in full.
     """
-    return await _fetch_page_text(url)
+    return await _fetch_page_text(url, max_chars)
 
 
 # ---------------------------------------------------------------------------

@@ -58,7 +58,29 @@ from urllib.parse import quote_plus
 from mcp.server.fastmcp import Context, FastMCP, Image
 from playwright.async_api import async_playwright
 
-mcp = FastMCP("google-search")
+# Server instructions: with ToolSearch / defer_loading enabled, this is the only
+# text injected at session start (tool schemas are loaded on demand). Keep it
+# under 2KB and put trigger keywords first so Claude knows when to search for
+# these tools. See ToolSearch docs (anthropic/alwaysLoad, defer_loading).
+SERVER_INSTRUCTIONS = """\
+Use these tools whenever the task needs CURRENT, real-world, or external \
+information — anything past your knowledge cutoff or that must be looked up \
+online rather than recalled. Triggers: search, news, latest/today, price, \
+stock, research paper, open url / read this link.
+
+Tools :
+- google_search: general web search. Start here for most lookups.
+- visit_page: fetch a URL's text — use after google_search, or on a user link.
+- google_news: recent news headlines.
+- google_scholar: academic papers and citations.
+- google_images: image search (inline thumbnails).
+- google_trends: search-interest trends.
+- wikipedia: look up a Wikipedia article (any language).
+
+Typical flow: google_search to find URLs, then visit_page to read one.
+"""
+
+mcp = FastMCP("google-search", instructions=SERVER_INSTRUCTIONS)
 
 # ---------------------------------------------------------------------------
 # Tool allowlist: only register the tools we actually use. Every function is
@@ -1141,7 +1163,7 @@ async def _do_google_search(
             await browser.close()
 
 
-@mcp.tool()
+@mcp.tool(meta={"anthropic/alwaysLoad": True})
 async def google_search(
     query: str,
     num_results: int = 10,
@@ -4833,7 +4855,7 @@ async def _fetch_page_text(url: str, max_chars: int = DEFAULT_MAX_PAGE_CHARS) ->
             await browser.close()
 
 
-@mcp.tool()
+@mcp.tool(meta={"anthropic/alwaysLoad": True})
 async def visit_page(url: str, max_chars: int = DEFAULT_MAX_PAGE_CHARS) -> str:
     """Fetch a web page and return its text content. Use this after google_search to read the actual content of a result.
 

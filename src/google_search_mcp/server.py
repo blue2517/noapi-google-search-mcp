@@ -1060,19 +1060,23 @@ async def _do_google_search(
                     _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
-            # Search pages now often attach the outer div#search while keeping it
-            # hidden. Playwright's default wait_for_selector waits for visibility,
-            # which turns a usable page into a 15s timeout. Wait for actual result
-            # nodes instead, and if the layout is unfamiliar let the scraper try.
-            search_selector = "div#search div.g:has(h3), div#rso div.g:has(h3), div#rso a:has(h3)"
+            # Google sometimes keeps div#search in the DOM but hidden (CSS),
+            # so waiting for it to be *visible* can hang the full 15s even on a
+            # good page. Wait for actual result tiles instead, and fall back to
+            # networkidle so an unfamiliar layout still gets scraped.
+            _results_selector = (
+                "div#search div.g:has(h3), div#rso div.g:has(h3), "
+                "div#search a:has(h3), div#rso a:has(h3), "
+                "div#search h3, div#rso h3"
+            )
             try:
-                await browser_page.wait_for_selector(search_selector, timeout=15000)
+                await browser_page.wait_for_selector(_results_selector, timeout=15000)
             except Exception:
                 if await _is_blocked(browser_page):
                     if not await _handle_block(browser_page, "google_search", query):
                         _clear_cookies(reset_profile=True)
                         return BLOCK_MESSAGE
-                    await browser_page.wait_for_selector(search_selector, timeout=15000)
+                    await browser_page.wait_for_selector(_results_selector, timeout=15000)
                 else:
                     _log("SEARCH_SELECTOR_MISS", tool="google_search", query=query, url=browser_page.url)
                     try:
@@ -1083,6 +1087,7 @@ async def _do_google_search(
             results = await browser_page.evaluate(
                 """
                 (numResults) => {
+                    const _txt = (el) => (el.innerText || el.textContent || '').trim();
                     const results = [];
                     const containers = document.querySelectorAll('div#search div.g, div#rso div.g');
                     for (const el of containers) {
@@ -1094,9 +1099,9 @@ async def _do_google_search(
                         );
                         if (linkEl && titleEl) {
                             results.push({
-                                title: titleEl.innerText.trim(),
+                                title: _txt(titleEl),
                                 url: linkEl.href,
-                                snippet: snippetEl ? snippetEl.innerText.trim() : ''
+                                snippet: snippetEl ? _txt(snippetEl) : ''
                             });
                         }
                     }
@@ -1111,9 +1116,9 @@ async def _do_google_search(
                                     'div[data-sncf], div.VwiC3b, span.aCOpRe, div[style*="-webkit-line-clamp"]'
                                 );
                                 results.push({
-                                    title: h3.innerText.trim(),
+                                    title: _txt(h3),
                                     url: a.href,
-                                    snippet: snippetEl ? snippetEl.innerText.trim() : ''
+                                    snippet: snippetEl ? _txt(snippetEl) : ''
                                 });
                             }
                         }
@@ -1260,8 +1265,9 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
             results = await page.evaluate(
                 """
                 (numResults) => {
+                    const _txt = (el) => (el.innerText || el.textContent || '').trim();
                     const results = [];
-                    const containers = document.querySelectorAll('div#search div.SoaBEf, div#search div.g');
+                    const containers = document.querySelectorAll('div#search div.SoaBEf, div#search div.g, div#rso div.SoaBEf, div#rso div.g');
                     for (const el of containers) {
                         if (results.length >= numResults) break;
                         const linkEl = el.querySelector('a[href^="http"]');
@@ -1281,23 +1287,23 @@ async def _do_google_news(query: str, num_results: int = 5) -> list:
                                 if (s.startsWith('//')) { thumbnail = 'https:' + s; break; }
                             }
                             results.push({
-                                title: titleEl.innerText.trim(),
+                                title: _txt(titleEl),
                                 url: linkEl.href,
-                                source: sourceEl ? sourceEl.innerText.trim() : '',
-                                time: timeEl ? timeEl.innerText.trim() : '',
-                                snippet: snippetEl ? snippetEl.innerText.trim() : '',
+                                source: sourceEl ? _txt(sourceEl) : '',
+                                time: timeEl ? _txt(timeEl) : '',
+                                snippet: snippetEl ? _txt(snippetEl) : '',
                                 thumbnail: thumbnail,
                             });
                         }
                     }
                     if (results.length === 0) {
-                        const allLinks = document.querySelectorAll('div#search a[href^="http"]');
+                        const allLinks = document.querySelectorAll('div#search a[href^="http"], div#rso a[href^="http"]');
                         for (const a of allLinks) {
                             if (results.length >= numResults) break;
                             const heading = a.querySelector('div[role="heading"], h3');
                             if (heading) {
                                 results.push({
-                                    title: heading.innerText.trim(),
+                                    title: _txt(heading),
                                     url: a.href,
                                     source: '', time: '', snippet: ''
                                 });

@@ -1060,26 +1060,31 @@ async def _do_google_search(
                     _clear_cookies(reset_profile=True)
                     return BLOCK_MESSAGE
 
+            # Search pages now often attach the outer div#search while keeping it
+            # hidden. Playwright's default wait_for_selector waits for visibility,
+            # which turns a usable page into a 15s timeout. Wait for actual result
+            # nodes instead, and if the layout is unfamiliar let the scraper try.
+            search_selector = "div#search div.g:has(h3), div#rso div.g:has(h3), div#rso a:has(h3)"
             try:
-                await browser_page.wait_for_selector("div#search", timeout=15000)
+                await browser_page.wait_for_selector(search_selector, timeout=15000)
             except Exception:
-                # The results container never appeared. Most often this means we
-                # were quietly redirected to a CAPTCHA/sorry page (div#search is
-                # hidden). Detect, try to solve, and retry once before failing.
                 if await _is_blocked(browser_page):
                     if not await _handle_block(browser_page, "google_search", query):
                         _clear_cookies(reset_profile=True)
                         return BLOCK_MESSAGE
-                    await browser_page.wait_for_selector("div#search", timeout=15000)
+                    await browser_page.wait_for_selector(search_selector, timeout=15000)
                 else:
-                    _log("TIMEOUT", tool="google_search", query=query, url=browser_page.url)
-                    raise
+                    _log("SEARCH_SELECTOR_MISS", tool="google_search", query=query, url=browser_page.url)
+                    try:
+                        await browser_page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
 
             results = await browser_page.evaluate(
                 """
                 (numResults) => {
                     const results = [];
-                    const containers = document.querySelectorAll('div#search div.g');
+                    const containers = document.querySelectorAll('div#search div.g, div#rso div.g');
                     for (const el of containers) {
                         if (results.length >= numResults) break;
                         const linkEl = el.querySelector('a[href^="http"]');
@@ -1096,7 +1101,7 @@ async def _do_google_search(
                         }
                     }
                     if (results.length === 0) {
-                        const allLinks = document.querySelectorAll('div#search a[href^="http"]');
+                        const allLinks = document.querySelectorAll('div#search a[href^="http"], div#rso a[href^="http"]');
                         for (const a of allLinks) {
                             if (results.length >= numResults) break;
                             const h3 = a.querySelector('h3');

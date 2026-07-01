@@ -71,10 +71,7 @@ stock, research paper, open url / read this link.
 Tools :
 - google_search: general web search. Start here for most lookups.
 - visit_page: fetch a URL's text — use after google_search, or on a user link.
-- google_news: recent news headlines.
 - google_scholar: academic papers and citations.
-- google_images: image search (inline thumbnails).
-- google_trends: search-interest trends.
 - wikipedia: look up a Wikipedia article (any language).
 
 Typical flow: google_search to find URLs, then visit_page to read one.
@@ -90,10 +87,7 @@ mcp = FastMCP("google-search", instructions=SERVER_INSTRUCTIONS)
 # ---------------------------------------------------------------------------
 ENABLED_TOOLS = {
     "google_search",
-    "google_news",
     "google_scholar",
-    "google_images",
-    "google_trends",
     "visit_page",
     "wikipedia",
 }
